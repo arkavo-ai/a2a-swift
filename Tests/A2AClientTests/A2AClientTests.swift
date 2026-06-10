@@ -181,6 +181,54 @@ struct A2AClientTests {
         #expect(json["method"] == .string("SendStreamingMessage"))
     }
 
+    @Test func plainJSONErrorResponseToStreamingCallThrows() async throws {
+        // Some servers answer a failed streaming request with a plain JSON-RPC
+        // error envelope instead of an SSE-framed one (the spec mandates
+        // neither). The client must surface it, not yield an empty stream.
+        let transport = MockTransport()
+        transport.streamChunks = [
+            Data(
+                #"{"jsonrpc":"2.0","id":"1","error":{"code":-32004,"message":"This operation is not supported"}}"#
+                    .utf8)
+        ]
+        let client = A2AClient(interface: testInterface, transport: transport)
+
+        await #expect(throws: A2AError(.unsupportedOperation)) {
+            for try await _ in client.subscribeToTask(SubscribeToTaskRequest(id: "task-1")) {}
+        }
+    }
+
+    @Test func plainJSONResultResponseToStreamingCallYieldsEvent() async throws {
+        let transport = MockTransport()
+        transport.streamChunks = [
+            Data(#"{"jsonrpc":"2.0","id":"1","result":{"task":\#(workingTask)}}"#.utf8)
+        ]
+        let client = A2AClient(interface: testInterface, transport: transport)
+
+        var events: [StreamResponse] = []
+        for try await event in client.subscribeToTask(SubscribeToTaskRequest(id: "task-1")) {
+            events.append(event)
+        }
+        #expect(events.count == 1)
+        guard case .task(let task) = events[0] else {
+            Issue.record("expected task event")
+            return
+        }
+        #expect(task.id == "task-1")
+    }
+
+    @Test func nonJSONStreamWithoutEventsEndsEmpty() async throws {
+        let transport = MockTransport()
+        transport.streamChunks = [Data(": keep-alive comment only\n\n".utf8)]
+        let client = A2AClient(interface: testInterface, transport: transport)
+
+        var count = 0
+        for try await _ in client.subscribeToTask(SubscribeToTaskRequest(id: "task-1")) {
+            count += 1
+        }
+        #expect(count == 0)
+    }
+
     @Test func streamingErrorEventThrows() async throws {
         let transport = MockTransport()
         transport.streamChunks = [

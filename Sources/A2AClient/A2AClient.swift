@@ -215,8 +215,20 @@ public struct A2AClient: Sendable {
                         JSONRPCRequest(
                             id: .string(UUID().uuidString), method: method, params: params))
                     var parser = SSEParser()
+                    // Some servers answer a streaming request that fails before
+                    // any event with a plain JSON-RPC error envelope instead of
+                    // an SSE-framed one (the spec does not mandate either).
+                    // Buffer the raw bytes until the first SSE event so such a
+                    // response can be decoded and surfaced rather than reading
+                    // as an empty, successfully closed stream.
+                    var preludeBuffer = Data()
+                    var sawEvent = false
                     for try await chunk in transport.stream(request) {
+                        if !sawEvent && preludeBuffer.count < 1 << 20 {
+                            preludeBuffer.append(chunk)
+                        }
                         for event in parser.feed(chunk) {
+                            sawEvent = true
                             let response = try A2AJSON.decoder().decode(
                                 JSONRPCResponse<StreamResponse>.self, from: Data(event.data.utf8))
                             if let error = response.error {
@@ -225,6 +237,17 @@ public struct A2AClient: Sendable {
                             if let result = response.result {
                                 continuation.yield(result)
                             }
+                        }
+                    }
+                    if !sawEvent, !preludeBuffer.isEmpty,
+                        let response = try? A2AJSON.decoder().decode(
+                            JSONRPCResponse<StreamResponse>.self, from: preludeBuffer)
+                    {
+                        if let error = response.error {
+                            throw A2AError(error)
+                        }
+                        if let result = response.result {
+                            continuation.yield(result)
                         }
                     }
                     continuation.finish()
